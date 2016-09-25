@@ -15,6 +15,7 @@ import (
 	"github.com/coreos/dex/pkg/log"
 	"github.com/coreos/dex/refresh"
 	"github.com/coreos/dex/repo"
+	"github.com/coreos/dex/scope"
 )
 
 const (
@@ -38,10 +39,10 @@ type refreshTokenRepo struct {
 type refreshTokenModel struct {
 	ID          int64  `db:"id"`
 	PayloadHash []byte `db:"payload_hash"`
-	// TODO(yifan): Use some sort of foreign key to manage database level
-	// data integrity.
-	UserID   string `db:"user_id"`
-	ClientID string `db:"client_id"`
+	UserID      string `db:"user_id"`
+	ClientID    string `db:"client_id"`
+	ConnectorID string `db:"connector_id"`
+	Scopes      string `db:"scopes"`
 }
 
 // buildToken combines the token ID and token payload to create a new token.
@@ -89,7 +90,131 @@ func NewRefreshTokenRepoWithGenerator(dbm *gorp.DbMap, gen refresh.RefreshTokenG
 	}
 }
 
-func (r *refreshTokenRepo) Create(userID, clientID string) (string, error) {
+func (r *refreshTokenRepo) Create(userID, clientID, connectorID string, scopes []string) (string, error) {
+	return r.create(nil, userID, clientID, connectorID, scopes)
+}
+
+func (r *refreshTokenRepo) Verify(clientID, token string) (userID, connectorID string, scope scope.Scopes, err error) {
+	return r.verify(nil, clientID, token)
+}
+
+func (r *refreshTokenRepo) Revoke(userID, token string) error {
+	tx, err := r.begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := r.revoke(tx, userID, token); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func (r *refreshTokenRepo) RenewRefreshToken(clientID, userID, oldToken string) (newRefreshToken string, err error) {
+	// Verify
+	userID, connectorID, scopes, err := r.verify(nil, clientID, oldToken)
+	if err != nil {
+		return "", err
+	}
+
+	// Revoke old refresh token
+	tx, err := r.begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	if err := r.revoke(tx, userID, oldToken); err != nil {
+		return "", err
+	}
+
+	// Renew refresh token
+	newRefreshToken, err = r.create(tx, userID, clientID, connectorID, scopes)
+	if err != nil {
+		return "", err
+	}
+
+	return newRefreshToken, tx.Commit()
+}
+
+func (r *refreshTokenRepo) RevokeTokensForClient(userID, clientID string) error {
+	q := fmt.Sprintf("DELETE FROM %s WHERE user_id = $1 AND client_id = $2", r.quote(refreshTokenTableName))
+	_, err := r.executor(nil).Exec(q, userID, clientID)
+	return err
+}
+
+func (r *refreshTokenRepo) ClientsWithRefreshTokens(userID string) ([]client.Client, error) {
+	q := `SELECT c.* FROM %s as c
+	INNER JOIN %s as r ON c.id = r.client_id WHERE r.user_id = $1;`
+	q = fmt.Sprintf(q, r.quote(clientTableName), r.quote(refreshTokenTableName))
+	var clients []clientModel
+	if _, err := r.executor(nil).Select(&clients, q, userID); err != nil {
+		return nil, err
+	}
+
+	c := make([]client.Client, len(clients))
+	for i, client := range clients {
+		ident, err := client.Client()
+		if err != nil {
+			return nil, err
+		}
+		c[i] = *ident
+		// Do not share the secret.
+		c[i].Credentials.Secret = ""
+	}
+
+	return c, nil
+}
+
+func (r *refreshTokenRepo) get(tx repo.Transaction, tokenID int64) (*refreshTokenModel, error) {
+	ex := r.executor(tx)
+	result, err := ex.Get(refreshTokenModel{}, tokenID)
+	if err != nil {
+		return nil, err
+	}
+
+	if result == nil {
+		return nil, refresh.ErrorInvalidToken
+	}
+
+	record, ok := result.(*refreshTokenModel)
+	if !ok {
+		log.Errorf("expected refreshTokenModel but found %v", reflect.TypeOf(result))
+		return nil, errors.New("unrecognized model")
+	}
+	return record, nil
+}
+
+func (r *refreshTokenRepo) verify(tx repo.Transaction, clientID, token string) (userID, connectorID string, scope scope.Scopes, err error) {
+	tokenID, tokenPayload, err := parseToken(token)
+
+	if err != nil {
+		return
+	}
+
+	record, err := r.get(tx, tokenID)
+	if err != nil {
+		return
+	}
+
+	if record.ClientID != clientID {
+		return "", "", nil, refresh.ErrorInvalidClientID
+	}
+
+	// Check if the hash of token received is the same stored in database
+	if err = checkTokenPayload(record.PayloadHash, tokenPayload); err != nil {
+		return
+	}
+
+	var scopes []string
+	if len(record.Scopes) > 0 {
+		scopes = strings.Split(record.Scopes, " ")
+	}
+
+	return record.UserID, record.ConnectorID, scopes, nil
+}
+
+func (r *refreshTokenRepo) create(tx repo.Transaction, userID, clientID, connectorID string, scopes []string) (string, error) {
 	if userID == "" {
 		return "", refresh.ErrorInvalidUserID
 	}
@@ -112,49 +237,23 @@ func (r *refreshTokenRepo) Create(userID, clientID string) (string, error) {
 		PayloadHash: payloadHash,
 		UserID:      userID,
 		ClientID:    clientID,
+		ConnectorID: connectorID,
+		Scopes:      strings.Join(scopes, " "),
 	}
 
-	if err := r.executor(nil).Insert(record); err != nil {
+	if err := r.executor(tx).Insert(record); err != nil {
 		return "", err
 	}
 
 	return buildToken(record.ID, tokenPayload), nil
 }
 
-func (r *refreshTokenRepo) Verify(clientID, token string) (string, error) {
-	tokenID, tokenPayload, err := parseToken(token)
-
-	if err != nil {
-		return "", err
-	}
-
-	record, err := r.get(nil, tokenID)
-	if err != nil {
-		return "", err
-	}
-
-	if record.ClientID != clientID {
-		return "", refresh.ErrorInvalidClientID
-	}
-
-	if err := checkTokenPayload(record.PayloadHash, tokenPayload); err != nil {
-		return "", err
-	}
-
-	return record.UserID, nil
-}
-
-func (r *refreshTokenRepo) Revoke(userID, token string) error {
+func (r *refreshTokenRepo) revoke(tx repo.Transaction, userID, token string) error {
 	tokenID, tokenPayload, err := parseToken(token)
 	if err != nil {
 		return err
 	}
 
-	tx, err := r.begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
 	exec := r.executor(tx)
 	record, err := r.get(tx, tokenID)
 	if err != nil {
@@ -177,53 +276,5 @@ func (r *refreshTokenRepo) Revoke(userID, token string) error {
 		return refresh.ErrorInvalidToken
 	}
 
-	return tx.Commit()
-}
-
-func (r *refreshTokenRepo) RevokeTokensForClient(userID, clientID string) error {
-	q := fmt.Sprintf("DELETE FROM %s WHERE user_id = $1 AND client_id = $2", r.quote(refreshTokenTableName))
-	_, err := r.executor(nil).Exec(q, userID, clientID)
-	return err
-}
-
-func (r *refreshTokenRepo) ClientsWithRefreshTokens(userID string) ([]client.Client, error) {
-	q := `SELECT c.* FROM %s as c
-	INNER JOIN %s as r ON c.id = r.client_id WHERE r.user_id = $1;`
-	q = fmt.Sprintf(q, r.quote(clientTableName), r.quote(refreshTokenTableName))
-
-	var clients []clientModel
-	if _, err := r.executor(nil).Select(&clients, q, userID); err != nil {
-		return nil, err
-	}
-
-	c := make([]client.Client, len(clients))
-	for i, client := range clients {
-		ident, err := client.Client()
-		if err != nil {
-			return nil, err
-		}
-		c[i] = *ident
-		// Do not share the secret.
-		c[i].Credentials.Secret = ""
-	}
-	return c, nil
-}
-
-func (r *refreshTokenRepo) get(tx repo.Transaction, tokenID int64) (*refreshTokenModel, error) {
-	ex := r.executor(tx)
-	result, err := ex.Get(refreshTokenModel{}, tokenID)
-	if err != nil {
-		return nil, err
-	}
-
-	if result == nil {
-		return nil, refresh.ErrorInvalidToken
-	}
-
-	record, ok := result.(*refreshTokenModel)
-	if !ok {
-		log.Errorf("expected refreshTokenModel but found %v", reflect.TypeOf(result))
-		return nil, errors.New("unrecognized model")
-	}
-	return record, nil
+	return nil
 }

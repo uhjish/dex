@@ -79,10 +79,16 @@ var (
 		},
 	}
 
-	userBadClientID = "ZZZ"
+	userBadClientID = testBadRedirectURL.Host
 
 	userGoodToken = makeUserToken(testIssuerURL,
 		"ID-1", testClientID, time.Hour*1, testPrivKey)
+
+	clientToken = makeClientToken(testIssuerURL,
+		testClientID, time.Hour*1, testPrivKey)
+
+	badClientToken = makeClientToken(testIssuerURL,
+		userBadClientID, time.Hour*1, testPrivKey)
 
 	userBadTokenNotAdmin = makeUserToken(testIssuerURL,
 		"ID-2", testClientID, time.Hour*1, testPrivKey)
@@ -97,13 +103,13 @@ var (
 		"ID-4", testClientID, time.Hour*1, testPrivKey)
 )
 
-func makeUserAPITestFixtures() *userAPITestFixtures {
+func makeUserAPITestFixtures(clientCredsFlag bool) *userAPITestFixtures {
 	f := &userAPITestFixtures{}
 
 	dbMap, _, _, um := makeUserObjects(userUsers, userPasswords)
-	cir := func() client.ClientRepo {
-		repo, err := db.NewClientRepoFromClients(dbMap, []client.Client{
-			client.Client{
+	clients := []client.LoadableClient{
+		{
+			Client: client.Client{
 				Credentials: oidc.ClientCredentials{
 					ID:     testClientID,
 					Secret: testClientSecret,
@@ -114,25 +120,27 @@ func makeUserAPITestFixtures() *userAPITestFixtures {
 					},
 				},
 			},
-			client.Client{
+		},
+		{
+			Client: client.Client{
 				Credentials: oidc.ClientCredentials{
 					ID:     userBadClientID,
 					Secret: base64.URLEncoding.EncodeToString([]byte("secret")),
 				},
 				Metadata: oidc.ClientMetadata{
 					RedirectURIs: []url.URL{
-						testRedirectURL,
+						testBadRedirectURL,
 					},
 				},
 			},
-		})
-		if err != nil {
-			panic("Failed to create client identity repo: " + err.Error())
-		}
-		return repo
-	}()
+		},
+	}
 
-	cir.SetDexAdmin(testClientID, true)
+	_, clientManager, err := makeClientRepoAndManager(dbMap, clients)
+	if err != nil {
+		panic("Failed to create client identity manager: " + err.Error())
+	}
+	clientManager.SetDexAdmin(testClientID, true)
 
 	noop := func() error { return nil }
 
@@ -146,15 +154,17 @@ func makeUserAPITestFixtures() *userAPITestFixtures {
 
 	refreshRepo := db.NewRefreshTokenRepo(dbMap)
 	for _, user := range userUsers {
-		if _, err := refreshRepo.Create(user.User.ID, testClientID); err != nil {
+		if _, err := refreshRepo.Create(user.User.ID, testClientID,
+			"", append([]string{"offline_access"}, oidc.DefaultScope...)); err != nil {
 			panic("Failed to create refresh token: " + err.Error())
 		}
 	}
 
 	f.emailer = &testEmailer{}
 	um.Clock = clock
-	api := api.NewUsersAPI(dbMap, um, f.emailer, "local")
-	usrSrv := server.NewUserMgmtServer(api, jwtvFactory, um, cir)
+
+	api := api.NewUsersAPI(um, clientManager, refreshRepo, f.emailer, "local", clientCredsFlag)
+	usrSrv := server.NewUserMgmtServer(api, jwtvFactory, um, clientManager, clientCredsFlag)
 	f.hSrv = httptest.NewServer(usrSrv.HTTPHandler())
 
 	f.trans = &tokenHandlerTransport{
@@ -176,48 +186,89 @@ func TestGetUser(t *testing.T) {
 		token string
 
 		errCode int
+
+		clientCredsFlag bool
 	}{
 		{
 			id: "ID-1",
 
 			token:   userGoodToken,
 			errCode: 0,
-		}, {
+
+			clientCredsFlag: false,
+		},
+		{
+			id: "ID-1",
+
+			token:   clientToken,
+			errCode: 0,
+
+			clientCredsFlag: true,
+		},
+		{
+			id: "ID-1",
+
+			token:   badClientToken,
+			errCode: http.StatusForbidden,
+
+			clientCredsFlag: true,
+		},
+		{
+			id: "ID-1",
+
+			token:   clientToken,
+			errCode: http.StatusUnauthorized,
+
+			clientCredsFlag: false,
+		},
+		{
 			id: "NOONE",
 
 			token:   userGoodToken,
 			errCode: http.StatusNotFound,
+
+			clientCredsFlag: false,
 		}, {
 			id: "ID-1",
 
 			token:   userBadTokenNotAdmin,
 			errCode: http.StatusUnauthorized,
+
+			clientCredsFlag: false,
 		}, {
 			id: "ID-1",
 
 			token:   userBadTokenExpired,
 			errCode: http.StatusUnauthorized,
+
+			clientCredsFlag: false,
 		}, {
 			id: "ID-1",
 
 			token:   userBadTokenDisabled,
 			errCode: http.StatusUnauthorized,
+
+			clientCredsFlag: false,
 		}, {
 			id: "ID-1",
 
 			token:   "",
 			errCode: http.StatusUnauthorized,
+
+			clientCredsFlag: false,
 		}, {
 			id: "ID-1",
 
 			token:   "gibberish",
 			errCode: http.StatusUnauthorized,
+
+			clientCredsFlag: false,
 		},
 	}
 
 	for i, tt := range tests {
 		func() {
-			f := makeUserAPITestFixtures()
+			f := makeUserAPITestFixtures(tt.clientCredsFlag)
 			f.trans.Token = tt.token
 
 			defer f.close()
@@ -314,7 +365,7 @@ func TestListUsers(t *testing.T) {
 
 	for i, tt := range tests {
 		func() {
-			f := makeUserAPITestFixtures()
+			f := makeUserAPITestFixtures(false)
 			defer f.close()
 			f.trans.Token = tt.token
 
@@ -378,6 +429,8 @@ func TestCreateUser(t *testing.T) {
 
 		wantResponse schema.UserCreateResponse
 		wantCode     int
+
+		clientCredsFlag bool
 	}{
 		{
 
@@ -404,6 +457,71 @@ func TestCreateUser(t *testing.T) {
 					CreatedAt:     clock.Now().Format(time.RFC3339),
 				},
 			},
+		},
+		{
+
+			req: schema.UserCreateRequest{
+				User: &schema.User{
+					Email:         "newuser@example.com",
+					DisplayName:   "New User",
+					EmailVerified: true,
+					Admin:         false,
+					CreatedAt:     clock.Now().Format(time.RFC3339),
+				},
+				RedirectURL: testRedirectURL.String(),
+			},
+
+			token: clientToken,
+
+			wantResponse: schema.UserCreateResponse{
+				EmailSent: true,
+				User: &schema.User{
+					Email:         "newuser@example.com",
+					DisplayName:   "New User",
+					EmailVerified: true,
+					Admin:         false,
+					CreatedAt:     clock.Now().Format(time.RFC3339),
+				},
+			},
+
+			clientCredsFlag: true,
+		},
+		{
+
+			req: schema.UserCreateRequest{
+				User: &schema.User{
+					Email:         "newuser@example.com",
+					DisplayName:   "New User",
+					EmailVerified: true,
+					Admin:         false,
+					CreatedAt:     clock.Now().Format(time.RFC3339),
+				},
+				RedirectURL: testRedirectURL.String(),
+			},
+
+			token: badClientToken,
+
+			wantCode: http.StatusForbidden,
+
+			clientCredsFlag: true,
+		},
+		{
+
+			// Duplicate email
+			req: schema.UserCreateRequest{
+				User: &schema.User{
+					Email:         "Email-1@example.com",
+					DisplayName:   "New User",
+					EmailVerified: true,
+					Admin:         false,
+					CreatedAt:     clock.Now().Format(time.RFC3339),
+				},
+				RedirectURL: testRedirectURL.String(),
+			},
+
+			token: userGoodToken,
+
+			wantCode: http.StatusConflict,
 		},
 		{
 
@@ -467,6 +585,28 @@ func TestCreateUser(t *testing.T) {
 			wantCode: http.StatusUnauthorized,
 		},
 		{
+
+			req: schema.UserCreateRequest{
+				User: &schema.User{
+					Email:         "newuser@example.com",
+					DisplayName:   "New User",
+					EmailVerified: true,
+					Admin:         false,
+					CreatedAt:     clock.Now().Format(time.RFC3339),
+				},
+
+				RedirectURL: testRedirectURL.String(),
+			},
+
+			// make sure that the endpoint is protected, but don't exhaustively
+			// try every variation like in TestGetUser
+			token: clientToken,
+
+			wantCode: http.StatusUnauthorized,
+
+			clientCredsFlag: false,
+		},
+		{
 			req: schema.UserCreateRequest{
 				User: &schema.User{
 					Email:         "newuser@example.com",
@@ -485,7 +625,7 @@ func TestCreateUser(t *testing.T) {
 	}
 	for i, tt := range tests {
 		func() {
-			f := makeUserAPITestFixtures()
+			f := makeUserAPITestFixtures(tt.clientCredsFlag)
 			defer f.close()
 			f.trans.Token = tt.token
 			f.emailer.cantEmail = tt.cantEmail
@@ -536,7 +676,7 @@ func TestCreateUser(t *testing.T) {
 			wantEmalier := testEmailer{
 				cantEmail:       tt.cantEmail,
 				lastEmail:       tt.req.User.Email,
-				lastClientID:    "XXX",
+				lastClientID:    testClientID,
 				lastWasInvite:   true,
 				lastRedirectURL: *urlParsed,
 			}
@@ -566,7 +706,7 @@ func TestDisableUser(t *testing.T) {
 	}
 
 	for i, tt := range tests {
-		f := makeUserAPITestFixtures()
+		f := makeUserAPITestFixtures(false)
 
 		usr, err := f.client.Users.Get(tt.id).Do()
 		if err != nil {
@@ -603,7 +743,7 @@ func TestRefreshTokenEndpoints(t *testing.T) {
 	}
 
 	for i, tt := range tests {
-		f := makeUserAPITestFixtures()
+		f := makeUserAPITestFixtures(false)
 		list, err := f.client.RefreshClient.List(tt.userID).Do()
 		if err != nil {
 			t.Errorf("case %d: list clients: %v", i, err)
@@ -619,7 +759,7 @@ func TestRefreshTokenEndpoints(t *testing.T) {
 			t.Errorf("case %d: expected client ids did not match actual: %s", i, diff)
 		}
 		for _, clientID := range ids {
-			if err := f.client.Clients.Revoke(tt.userID, clientID).Do(); err != nil {
+			if err := f.client.RefreshClient.Revoke(tt.userID, clientID).Do(); err != nil {
 				t.Errorf("case %d: failed to revoke client: %v", i, err)
 			}
 		}
@@ -644,6 +784,8 @@ func TestResendEmailInvitation(t *testing.T) {
 
 		wantResponse schema.ResendEmailInvitationResponse
 		wantCode     int
+
+		clientCredsFlag bool
 	}{
 		{
 
@@ -658,6 +800,36 @@ func TestResendEmailInvitation(t *testing.T) {
 			wantResponse: schema.ResendEmailInvitationResponse{
 				EmailSent: true,
 			},
+		},
+		{
+
+			req: schema.ResendEmailInvitationRequest{
+				RedirectURL: testRedirectURL.String(),
+			},
+
+			userID: "ID-3",
+			email:  "Email-3@example.com",
+			token:  clientToken,
+
+			wantResponse: schema.ResendEmailInvitationResponse{
+				EmailSent: true,
+			},
+
+			clientCredsFlag: true,
+		},
+		{
+
+			req: schema.ResendEmailInvitationRequest{
+				RedirectURL: testRedirectURL.String(),
+			},
+
+			userID: "ID-3",
+			email:  "Email-3@example.com",
+			token:  badClientToken,
+
+			wantCode: http.StatusForbidden,
+
+			clientCredsFlag: true,
 		},
 		{
 
@@ -727,6 +899,19 @@ func TestResendEmailInvitation(t *testing.T) {
 
 			userID: "ID-3",
 			email:  "Email-3@example.com",
+			token:  clientToken,
+
+			wantCode: http.StatusUnauthorized,
+
+			clientCredsFlag: false,
+		},
+		{
+			req: schema.ResendEmailInvitationRequest{
+				RedirectURL: testRedirectURL.String(),
+			},
+
+			userID: "ID-3",
+			email:  "Email-3@example.com",
 			token:  userBadTokenExpired,
 
 			wantCode: http.StatusUnauthorized,
@@ -756,7 +941,7 @@ func TestResendEmailInvitation(t *testing.T) {
 	}
 	for i, tt := range tests {
 		func() {
-			f := makeUserAPITestFixtures()
+			f := makeUserAPITestFixtures(tt.clientCredsFlag)
 			defer f.close()
 			f.trans.Token = tt.token
 			f.emailer.cantEmail = tt.cantEmail
@@ -799,7 +984,7 @@ func TestResendEmailInvitation(t *testing.T) {
 			wantEmalier := testEmailer{
 				cantEmail:       tt.cantEmail,
 				lastEmail:       strings.ToLower(tt.email),
-				lastClientID:    "XXX",
+				lastClientID:    testClientID,
 				lastWasInvite:   true,
 				lastRedirectURL: *urlParsed,
 			}
@@ -845,6 +1030,10 @@ func (t *testEmailer) SendInviteEmail(email string, redirectURL url.URL, clientI
 		retURL = &testResetPasswordURL
 	}
 	return retURL, nil
+}
+
+func makeClientToken(issuerURL url.URL, clientID string, expires time.Duration, privKey *key.PrivateKey) string {
+	return makeUserToken(issuerURL, clientID, clientID, expires, privKey)
 }
 
 func makeUserToken(issuerURL url.URL, userID, clientID string, expires time.Duration, privKey *key.PrivateKey) string {

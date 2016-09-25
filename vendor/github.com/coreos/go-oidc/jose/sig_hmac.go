@@ -1,13 +1,11 @@
 package jose
 
 import (
-	"bytes"
 	"crypto"
 	"crypto/hmac"
 	_ "crypto/sha256"
 	"errors"
 	"fmt"
-	"strings"
 )
 
 type VerifierHMAC struct {
@@ -21,7 +19,7 @@ type SignerHMAC struct {
 }
 
 func NewVerifierHMAC(jwk JWK) (*VerifierHMAC, error) {
-	if strings.ToUpper(jwk.Alg) != "HS256" {
+	if jwk.Alg != "" && jwk.Alg != "HS256" {
 		return nil, fmt.Errorf("unsupported key algorithm %q", jwk.Alg)
 	}
 
@@ -45,7 +43,9 @@ func (v *VerifierHMAC) Alg() string {
 func (v *VerifierHMAC) Verify(sig []byte, data []byte) error {
 	h := hmac.New(v.Hash.New, v.Secret)
 	h.Write(data)
-	if !bytes.Equal(sig, h.Sum(nil)) {
+	// hmac.Equal compares two hmacs but does it in constant time to mitigating time
+	// based attacks. See #98
+	if !hmac.Equal(sig, h.Sum(nil)) {
 		return errors.New("invalid hmac signature")
 	}
 	return nil

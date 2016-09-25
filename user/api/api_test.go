@@ -12,6 +12,7 @@ import (
 	"github.com/kylelemons/godebug/pretty"
 
 	"github.com/coreos/dex/client"
+	clientmanager "github.com/coreos/dex/client/manager"
 	"github.com/coreos/dex/connector"
 	"github.com/coreos/dex/db"
 	schema "github.com/coreos/dex/schema/workerschema"
@@ -50,14 +51,24 @@ func (t *testEmailer) sendEmail(email string, redirectURL url.URL, clientID stri
 }
 
 var (
-	clock = clockwork.NewFakeClock()
+	clock            = clockwork.NewFakeClock()
+	goodClientID     = "client.example.com"
+	nonAdminClientID = "user.example.com"
 
 	goodCreds = Creds{
 		User: user.User{
 			ID:    "ID-1",
 			Admin: true,
 		},
-		ClientID: "XXX",
+		ClientIDs: []string{goodClientID},
+	}
+
+	clientCreds = Creds{
+		User: user.User{
+			ID:    "",
+			Admin: false,
+		},
+		ClientIDs: []string{goodClientID},
 	}
 
 	badCreds = Creds{
@@ -66,13 +77,21 @@ var (
 		},
 	}
 
+	credsWithMultipleAudiences = Creds{
+		User: user.User{
+			ID:    "ID-1",
+			Admin: true,
+		},
+		ClientIDs: []string{nonAdminClientID, goodClientID},
+	}
+
 	disabledCreds = Creds{
 		User: user.User{
 			ID:       "ID-1",
 			Admin:    true,
 			Disabled: true,
 		},
-		ClientID: "XXX",
+		ClientIDs: []string{goodClientID},
 	}
 
 	resetPasswordURL = url.URL{
@@ -82,12 +101,17 @@ var (
 
 	validRedirURL = url.URL{
 		Scheme: "http",
-		Host:   "client.example.com",
+		Host:   goodClientID,
+		Path:   "/callback",
+	}
+	validRedirURL2 = url.URL{
+		Scheme: "http",
+		Host:   nonAdminClientID,
 		Path:   "/callback",
 	}
 )
 
-func makeTestFixtures() (*UsersAPI, *testEmailer) {
+func makeTestFixtures(clientCredsFlag bool) (*UsersAPI, *testEmailer) {
 	dbMap := db.NewMemDB()
 	ur := func() user.UserRepo {
 		repo, err := db.NewUserRepoFromUsers(dbMap, []user.UserWithRemoteIdentities{
@@ -158,8 +182,8 @@ func makeTestFixtures() (*UsersAPI, *testEmailer) {
 	mgr.Clock = clock
 	ci := client.Client{
 		Credentials: oidc.ClientCredentials{
-			ID:     "XXX",
-			Secret: base64.URLEncoding.EncodeToString([]byte("secrete")),
+			ID:     goodClientID,
+			Secret: base64.URLEncoding.EncodeToString([]byte("secret")),
 		},
 		Metadata: oidc.ClientMetadata{
 			RedirectURIs: []url.URL{
@@ -167,55 +191,89 @@ func makeTestFixtures() (*UsersAPI, *testEmailer) {
 			},
 		},
 	}
-	if _, err := db.NewClientRepoFromClients(dbMap, []client.Client{ci}); err != nil {
-		panic("Failed to create client  repo: " + err.Error())
+	ci2 := client.Client{
+		Credentials: oidc.ClientCredentials{
+			ID:     nonAdminClientID,
+			Secret: base64.URLEncoding.EncodeToString([]byte("anothersecret")),
+		},
+		Metadata: oidc.ClientMetadata{
+			RedirectURIs: []url.URL{
+				validRedirURL2,
+			},
+		},
 	}
+
+	clientIDGenerator := func(hostport string) (string, error) {
+		return hostport, nil
+	}
+	secGen := func() ([]byte, error) {
+		return []byte("secret"), nil
+	}
+	clientRepo, err := db.NewClientRepoFromClients(dbMap, []client.LoadableClient{{Client: ci}, {Client: ci2}})
+	if err != nil {
+		panic("Failed to create client manager: " + err.Error())
+	}
+	clientManager := clientmanager.NewClientManager(clientRepo, db.TransactionFactory(dbMap), clientmanager.ManagerOptions{ClientIDGenerator: clientIDGenerator, SecretGenerator: secGen})
 
 	// Used in TestRevokeRefreshToken test.
 	refreshTokens := []struct {
 		clientID string
 		userID   string
 	}{
-		{"XXX", "ID-1"},
-		{"XXX", "ID-2"},
+		{goodClientID, "ID-1"},
+		{goodClientID, "ID-2"},
 	}
 	refreshRepo := db.NewRefreshTokenRepo(dbMap)
 	for _, token := range refreshTokens {
-		if _, err := refreshRepo.Create(token.userID, token.clientID); err != nil {
+		if _, err := refreshRepo.Create(token.userID, token.clientID, "local", []string{"openid"}); err != nil {
 			panic("Failed to create refresh token: " + err.Error())
 		}
 	}
 
 	emailer := &testEmailer{}
-	api := NewUsersAPI(dbMap, mgr, emailer, "local")
+	api := NewUsersAPI(mgr, clientManager, refreshRepo, emailer, "local", clientCredsFlag)
 	return api, emailer
 
 }
 
 func TestGetUser(t *testing.T) {
 	tests := []struct {
-		creds   Creds
-		id      string
-		wantErr error
+		creds           Creds
+		id              string
+		wantErr         error
+		clientCredsFlag bool
 	}{
 		{
-			creds: goodCreds,
-			id:    "ID-1",
+			creds:           goodCreds,
+			id:              "ID-1",
+			clientCredsFlag: false,
 		},
 		{
-			creds:   badCreds,
-			id:      "ID-1",
-			wantErr: ErrorUnauthorized,
+			creds:           badCreds,
+			id:              "ID-1",
+			wantErr:         ErrorUnauthorized,
+			clientCredsFlag: false,
 		},
 		{
-			creds:   goodCreds,
-			id:      "NO_ID",
-			wantErr: ErrorResourceNotFound,
+			creds:           goodCreds,
+			id:              "NO_ID",
+			wantErr:         ErrorResourceNotFound,
+			clientCredsFlag: false,
+		},
+		{
+			creds:           credsWithMultipleAudiences,
+			id:              "ID-1",
+			clientCredsFlag: false,
+		},
+		{
+			creds:           clientCreds,
+			id:              "ID-1",
+			clientCredsFlag: true,
 		},
 	}
 
 	for i, tt := range tests {
-		api, _ := makeTestFixtures()
+		api, _ := makeTestFixtures(tt.clientCredsFlag)
 		usr, err := api.GetUser(tt.creds, tt.id)
 		if tt.wantErr != nil {
 			if err != tt.wantErr {
@@ -269,7 +327,7 @@ func TestListUsers(t *testing.T) {
 	}
 
 	for i, tt := range tests {
-		api, _ := makeTestFixtures()
+		api, _ := makeTestFixtures(false)
 
 		gotIDs := [][]string{}
 		var next string
@@ -306,7 +364,10 @@ func TestCreateUser(t *testing.T) {
 		redirURL  url.URL
 		cantEmail bool
 
+		clientCredsFlag bool
+
 		wantResponse schema.UserCreateResponse
+		wantClientID string
 		wantErr      error
 	}{
 		{
@@ -329,6 +390,54 @@ func TestCreateUser(t *testing.T) {
 					CreatedAt:     clock.Now().Format(time.RFC3339),
 				},
 			},
+			wantClientID:    goodClientID,
+			clientCredsFlag: false,
+		},
+		{
+			creds: clientCreds,
+			usr: schema.User{
+				Email:         "newuser01@example.com",
+				DisplayName:   "New User",
+				EmailVerified: true,
+				Admin:         false,
+			},
+			redirURL: validRedirURL,
+
+			wantResponse: schema.UserCreateResponse{
+				EmailSent: true,
+				User: &schema.User{
+					Email:         "newuser01@example.com",
+					DisplayName:   "New User",
+					EmailVerified: true,
+					Admin:         false,
+					CreatedAt:     clock.Now().Format(time.RFC3339),
+				},
+			},
+			wantClientID:    goodClientID,
+			clientCredsFlag: true,
+		},
+		{
+			creds: credsWithMultipleAudiences,
+			usr: schema.User{
+				Email:         "newuser01@example.com",
+				DisplayName:   "New User",
+				EmailVerified: true,
+				Admin:         false,
+			},
+			redirURL: validRedirURL,
+
+			wantResponse: schema.UserCreateResponse{
+				EmailSent: true,
+				User: &schema.User{
+					Email:         "newuser01@example.com",
+					DisplayName:   "New User",
+					EmailVerified: true,
+					Admin:         false,
+					CreatedAt:     clock.Now().Format(time.RFC3339),
+				},
+			},
+			wantClientID:    goodClientID,
+			clientCredsFlag: false,
 		},
 		{
 			creds: goodCreds,
@@ -351,6 +460,8 @@ func TestCreateUser(t *testing.T) {
 				},
 				ResetPasswordLink: resetPasswordURL.String(),
 			},
+			wantClientID:    goodClientID,
+			clientCredsFlag: false,
 		},
 		{
 			creds: goodCreds,
@@ -374,18 +485,20 @@ func TestCreateUser(t *testing.T) {
 			},
 			redirURL: validRedirURL,
 
-			wantErr: ErrorUnauthorized,
+			wantErr:         ErrorUnauthorized,
+			clientCredsFlag: false,
 		},
 	}
 
 	for i, tt := range tests {
-		api, emailer := makeTestFixtures()
+		api, emailer := makeTestFixtures(tt.clientCredsFlag)
 		emailer.cantEmail = tt.cantEmail
 
 		response, err := api.CreateUser(tt.creds, tt.usr, tt.redirURL)
 		if tt.wantErr != nil {
 			if err != tt.wantErr {
 				t.Errorf("case %d: want=%q, got=%q", i, tt.wantErr, err)
+				continue
 			}
 
 			tok := ""
@@ -409,11 +522,13 @@ func TestCreateUser(t *testing.T) {
 		}
 		if err != nil {
 			t.Errorf("case %d: want nil err, got: %q ", i, err)
+			continue
 		}
 
 		newID := response.User.Id
 		if newID == "" {
 			t.Errorf("case %d: expected non-empty newID", i)
+			continue
 		}
 
 		tt.wantResponse.User.Id = newID
@@ -425,7 +540,7 @@ func TestCreateUser(t *testing.T) {
 		wantEmalier := testEmailer{
 			cantEmail:       tt.cantEmail,
 			lastEmail:       tt.usr.Email,
-			lastClientID:    tt.creds.ClientID,
+			lastClientID:    tt.wantClientID,
 			lastRedirectURL: tt.redirURL,
 			lastWasInvite:   true,
 		}
@@ -460,7 +575,7 @@ func TestDisableUsers(t *testing.T) {
 	}
 
 	for i, tt := range tests {
-		api, _ := makeTestFixtures()
+		api, _ := makeTestFixtures(false)
 		_, err := api.DisableUser(goodCreds, tt.id, tt.disable)
 		if err != nil {
 			t.Fatalf("case %d: unexpected error: %v", i, err)
@@ -484,8 +599,11 @@ func TestResendEmailInvitation(t *testing.T) {
 		redirURL  url.URL
 		cantEmail bool
 
+		clientCredsFlag bool
+
 		wantResponse schema.ResendEmailInvitationResponse
 		wantErr      error
+		wantClientID string
 	}{
 		{
 			creds:    goodCreds,
@@ -496,6 +614,20 @@ func TestResendEmailInvitation(t *testing.T) {
 			wantResponse: schema.ResendEmailInvitationResponse{
 				EmailSent: true,
 			},
+			wantClientID:    goodClientID,
+			clientCredsFlag: false,
+		},
+		{
+			creds:    clientCreds,
+			userID:   "ID-1",
+			email:    "id1@example.com",
+			redirURL: validRedirURL,
+
+			wantResponse: schema.ResendEmailInvitationResponse{
+				EmailSent: true,
+			},
+			wantClientID:    goodClientID,
+			clientCredsFlag: true,
 		},
 		{
 			creds:     goodCreds,
@@ -508,6 +640,22 @@ func TestResendEmailInvitation(t *testing.T) {
 				EmailSent:         false,
 				ResetPasswordLink: resetPasswordURL.String(),
 			},
+			wantClientID:    goodClientID,
+			clientCredsFlag: false,
+		},
+		{
+			creds:     credsWithMultipleAudiences,
+			userID:    "ID-1",
+			email:     "id1@example.com",
+			redirURL:  validRedirURL,
+			cantEmail: true,
+
+			wantResponse: schema.ResendEmailInvitationResponse{
+				EmailSent:         false,
+				ResetPasswordLink: resetPasswordURL.String(),
+			},
+			wantClientID:    goodClientID,
+			clientCredsFlag: false,
 		},
 		{
 			creds:    badCreds,
@@ -515,7 +663,8 @@ func TestResendEmailInvitation(t *testing.T) {
 			email:    "id1@example.com",
 			redirURL: validRedirURL,
 
-			wantErr: ErrorUnauthorized,
+			wantErr:         ErrorUnauthorized,
+			clientCredsFlag: false,
 		},
 		{
 			creds:    goodCreds,
@@ -523,7 +672,8 @@ func TestResendEmailInvitation(t *testing.T) {
 			email:    "id1@example.com",
 			redirURL: url.URL{Host: "scammers.com"},
 
-			wantErr: ErrorInvalidRedirectURL,
+			wantErr:         ErrorInvalidRedirectURL,
+			clientCredsFlag: false,
 		},
 		{
 			creds:    goodCreds,
@@ -531,7 +681,8 @@ func TestResendEmailInvitation(t *testing.T) {
 			email:    "id2@example.com",
 			redirURL: validRedirURL,
 
-			wantErr: ErrorVerifiedEmail,
+			wantErr:         ErrorVerifiedEmail,
+			clientCredsFlag: false,
 		},
 		{
 			creds:    goodCreds,
@@ -539,12 +690,13 @@ func TestResendEmailInvitation(t *testing.T) {
 			email:    "non-existent@example.com",
 			redirURL: validRedirURL,
 
-			wantErr: ErrorResourceNotFound,
+			wantErr:         ErrorResourceNotFound,
+			clientCredsFlag: false,
 		},
 	}
 
 	for i, tt := range tests {
-		api, emailer := makeTestFixtures()
+		api, emailer := makeTestFixtures(tt.clientCredsFlag)
 		emailer.cantEmail = tt.cantEmail
 
 		response, err := api.ResendEmailInvitation(tt.creds, tt.userID, tt.redirURL)
@@ -565,7 +717,7 @@ func TestResendEmailInvitation(t *testing.T) {
 		wantEmailer := testEmailer{
 			cantEmail:       tt.cantEmail,
 			lastEmail:       tt.email,
-			lastClientID:    tt.creds.ClientID,
+			lastClientID:    tt.wantClientID,
 			lastRedirectURL: tt.redirURL,
 			lastWasInvite:   true,
 		}
@@ -582,11 +734,11 @@ func TestRevokeRefreshToken(t *testing.T) {
 		before   []string // clientIDs expected before the change.
 		after    []string // clientIDs expected after the change.
 	}{
-		{"ID-1", "XXX", []string{"XXX"}, []string{}},
-		{"ID-2", "XXX", []string{"XXX"}, []string{}},
+		{"ID-1", goodClientID, []string{goodClientID}, []string{}},
+		{"ID-2", goodClientID, []string{goodClientID}, []string{}},
 	}
 
-	api, _ := makeTestFixtures()
+	api, _ := makeTestFixtures(false)
 
 	listClientsWithRefreshTokens := func(creds Creds, userID string) ([]string, error) {
 		clients, err := api.ListClientsWithRefreshTokens(creds, userID)

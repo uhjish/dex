@@ -35,6 +35,17 @@ push() {
   docker push $repo:latest
 }
 
-test -z "$1" && build && push
-test "$1" = "push" && build && push
-test "$1" = "build" && build
+clean() {
+  docker rmi $repo:$version
+  docker rmi $repo:latest
+}
+
+if [[ "clean" == "$1" ]]; then
+  clean
+else
+  build
+  if [[ "push" == "$1" ]]; then
+    push
+  fi
+fi
+

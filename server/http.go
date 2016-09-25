@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/coreos/dex/connector"
 	phttp "github.com/coreos/dex/pkg/http"
 	"github.com/coreos/dex/pkg/log"
+	"github.com/coreos/dex/scope"
 )
 
 const (
@@ -43,6 +45,7 @@ var (
 	httpPathAcceptInvitation   = "/accept-invitation"
 	httpPathDebugVars          = "/debug/vars"
 	httpPathClientRegistration = "/registration"
+	httpPathOOB                = "/oob"
 
 	cookieLastSeen                 = "LastSeen"
 	cookieShowEmailVerifiedMessage = "ShowEmailVerifiedMessage"
@@ -129,6 +132,7 @@ var connectorDisplayNameMap = map[string]string{
 	"local":     "Email",
 	"github":    "GitHub",
 	"bitbucket": "Bitbucket",
+	"uaa":       "CloudFoundry User Account and Authentication (UAA)",
 }
 
 type Template interface {
@@ -187,7 +191,7 @@ func renderLoginPage(w http.ResponseWriter, r *http.Request, srv OIDCServer, idp
 
 	// Render error message if client id is invalid.
 	clientID := q.Get("client_id")
-	cm, err := srv.ClientMetadata(clientID)
+	_, err := srv.Client(clientID)
 	if err != nil {
 		log.Errorf("Failed fetching client %q from repo: %v", clientID, err)
 		td.Error = true
@@ -195,7 +199,7 @@ func renderLoginPage(w http.ResponseWriter, r *http.Request, srv OIDCServer, idp
 		execTemplate(w, tpl, td)
 		return
 	}
-	if cm == nil {
+	if err == client.ErrorNotFound {
 		td.Error = true
 		td.Message = "Authentication Error"
 		td.Detail = "Invalid client ID"
@@ -255,7 +259,7 @@ func renderLoginPage(w http.ResponseWriter, r *http.Request, srv OIDCServer, idp
 
 		v := r.URL.Query()
 		v.Set("connector_id", idpc.ID())
-		v.Set("response_type", q.Get("response_type"))
+		v.Set("response_type", "code")
 		link.URL = httpPathAuth + "?" + v.Encode()
 		td.Links = append(td.Links, link)
 	}
@@ -263,7 +267,7 @@ func renderLoginPage(w http.ResponseWriter, r *http.Request, srv OIDCServer, idp
 	execTemplate(w, tpl, td)
 }
 
-func handleAuthFunc(srv OIDCServer, idpcs []connector.Connector, tpl *template.Template, registrationEnabled bool) http.HandlerFunc {
+func handleAuthFunc(srv OIDCServer, baseURL url.URL, idpcs []connector.Connector, tpl *template.Template, registrationEnabled bool) http.HandlerFunc {
 	idx := makeConnectorMap(idpcs)
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
@@ -273,121 +277,12 @@ func handleAuthFunc(srv OIDCServer, idpcs []connector.Connector, tpl *template.T
 		}
 
 		q := r.URL.Query()
-
-		// Retrieve client id
-		clientid := q.Get("client_id")
-
-		// Retrieve state
-		state := q.Get("state")
-
-		// Retrieve response_type
-		responseType := q.Get("response_type")
-
-		// Retrieve scopes
-		qscope := strings.Fields(q.Get("scope"))
-
-		// Check client ID param
-		if clientid == "" {
-			log.Errorf("Invalid auth request: no client_id received")
-			writeAuthError(w, oauth2.NewError(oauth2.ErrorInvalidRequest), state)
-			return
-		}
-
-		// Check redirect_uri param, but if it's empty we don't return any error here
-		qru := q.Get("redirect_uri")
-		var rURL *url.URL
-		if qru != "" {
-			ru, err := url.Parse(qru)
-			if err != nil {
-				log.Errorf("Invalid auth request: %v", err)
-				writeAuthError(w, oauth2.NewError(oauth2.ErrorInvalidRequest), state)
-				return
-			}
-			rURL = ru
-		}
-
-		cm, err := srv.ClientMetadata(clientid)
-		if err != nil {
-			log.Errorf("Failed fetching client %q from repo: %v", clientid, err)
-			writeAuthError(w, oauth2.NewError(oauth2.ErrorServerError), state)
-			return
-		}
-		if cm == nil {
-			log.Errorf("Client %q not found", clientid)
-			writeAuthError(w, oauth2.NewError(oauth2.ErrorInvalidRequest), state)
-			return
-		}
-
-		if len(cm.RedirectURIs) == 0 {
-			log.Errorf("Client %q has no redirect URLs", clientid)
-			writeAuthError(w, oauth2.NewError(oauth2.ErrorServerError), state)
-			return
-		}
-
-		redirectURL, err := client.ValidRedirectURL(rURL, cm.RedirectURIs)
-		if err != nil {
-			switch err {
-			case (client.ErrorCantChooseRedirectURL):
-				log.Errorf("Request must provide redirect URL as client %q has registered many", clientid)
-				writeAuthError(w, oauth2.NewError(oauth2.ErrorInvalidRequest), state)
-				return
-			case (client.ErrorInvalidRedirectURL):
-				log.Errorf("Request provided unregistered redirect URL: %s", rURL)
-				writeAuthError(w, oauth2.NewError(oauth2.ErrorInvalidRequest), state)
-				return
-			case (client.ErrorNoValidRedirectURLs):
-				log.Errorf("There are no registered URLs for the requested client: %s", rURL)
-				writeAuthError(w, oauth2.NewError(oauth2.ErrorInvalidRequest), state)
-				return
-			default:
-				log.Errorf("Unexpected error checking redirect URL for client %q: %v", clientid, err)
-				writeAuthError(w, oauth2.NewError(oauth2.ErrorServerError), state)
-				return
-			}
-		}
-
-		// Response type check
-		switch responseType {
-		case "code": // Add more cases as we support more response types
-		default:
-			log.Errorf("Invalid auth request: unsupported response_type")
-			redirectAuthError(w, oauth2.NewError(oauth2.ErrorUnsupportedResponseType), state, redirectURL)
-			return
-		}
-
-		// Check scopes.
-		var scopes []string
-		foundOpenIDScope := false
-		for _, scope := range qscope {
-			switch scope {
-			case "openid":
-				foundOpenIDScope = true
-				scopes = append(scopes, scope)
-			case "offline_access":
-				// According to the spec, for offline_access scope, the client must
-				// use a response_type value that would result in an Authorization Code.
-				// Currently oauth2.ResponseTypeCode is the only supported response type,
-				// and it's been checked above, so we don't need to check it again here.
-				//
-				// TODO(yifan): Verify that 'consent' should be in 'prompt'.
-				scopes = append(scopes, scope)
-			default:
-				// Pass all other scopes.
-				scopes = append(scopes, scope)
-			}
-		}
-
-		if !foundOpenIDScope {
-			log.Errorf("Invalid auth request: missing 'openid' in 'scope'")
-			writeAuthError(w, oauth2.NewError(oauth2.ErrorInvalidRequest), state)
-			return
-		}
-
 		register := q.Get("register") == "1" && registrationEnabled
 		e := q.Get("error")
 		if e != "" {
-			if err := srv.KillSession(state); err != nil {
-				log.Errorf("Failed killing sessionKey %q: %v", state, err)
+			sessionKey := q.Get("state")
+			if err := srv.KillSession(sessionKey); err != nil {
+				log.Errorf("Failed killing sessionKey %q: %v", sessionKey, err)
 			}
 			renderLoginPage(w, r, srv, idpcs, register, tpl)
 			return
@@ -400,12 +295,62 @@ func handleAuthFunc(srv OIDCServer, idpcs []connector.Connector, tpl *template.T
 			return
 		}
 
+		acr, err := oauth2.ParseAuthCodeRequest(q)
+		if err != nil {
+			log.Errorf("Invalid auth request: %v", err)
+			writeAuthError(w, err, acr.State)
+			return
+		}
+
+		cli, err := srv.Client(acr.ClientID)
+		if err != nil {
+			log.Errorf("Failed fetching client %q from repo: %v", acr.ClientID, err)
+			writeAuthError(w, oauth2.NewError(oauth2.ErrorServerError), acr.State)
+			return
+		}
+		if err == client.ErrorNotFound {
+			log.Errorf("Client %q not found", acr.ClientID)
+			writeAuthError(w, oauth2.NewError(oauth2.ErrorInvalidRequest), acr.State)
+			return
+		}
+
+		redirectURL, err := cli.ValidRedirectURL(acr.RedirectURL)
+		if err != nil {
+			switch err {
+			case (client.ErrorCantChooseRedirectURL):
+				log.Errorf("Request must provide redirect URL as client %q has registered many", acr.ClientID)
+				writeAuthError(w, oauth2.NewError(oauth2.ErrorInvalidRequest), acr.State)
+				return
+			case (client.ErrorInvalidRedirectURL):
+				log.Errorf("Request provided unregistered redirect URL: %s", acr.RedirectURL)
+				writeAuthError(w, oauth2.NewError(oauth2.ErrorInvalidRequest), acr.State)
+				return
+			case (client.ErrorNoValidRedirectURLs):
+				log.Errorf("There are no registered URLs for the requested client: %s", acr.RedirectURL)
+				writeAuthError(w, oauth2.NewError(oauth2.ErrorInvalidRequest), acr.State)
+				return
+			}
+		}
+
+		if acr.ResponseType != oauth2.ResponseTypeCode {
+			log.Errorf("unexpected ResponseType: %v: ", acr.ResponseType)
+			redirectAuthError(w, oauth2.NewError(oauth2.ErrorUnsupportedResponseType), acr.State, redirectURL)
+			return
+		}
+
+		// Check scopes.
+		if scopeErr := validateScopes(srv, acr.ClientID, acr.Scope); scopeErr != nil {
+			log.Error(scopeErr)
+			writeAuthError(w, scopeErr, acr.State)
+			return
+		}
+
 		nonce := q.Get("nonce")
 
-		key, err := srv.NewSession(connectorID, clientid, state, redirectURL, nonce, register, qscope)
+		key, err := srv.NewSession(connectorID, acr.ClientID, acr.State, redirectURL, nonce, register, acr.Scope)
 		if err != nil {
 			log.Errorf("Error creating new session: %v: ", err)
-			redirectAuthError(w, err, state, redirectURL)
+			redirectAuthError(w, err, acr.State, redirectURL)
 			return
 		}
 
@@ -414,7 +359,7 @@ func handleAuthFunc(srv OIDCServer, idpcs []connector.Connector, tpl *template.T
 			if ok {
 				q := url.Values{}
 				q.Set("code", key)
-				ru := httpPathRegister + "?" + q.Encode()
+				ru := path.Join(baseURL.Path, httpPathRegister) + "?" + q.Encode()
 				w.Header().Set("Location", ru)
 				w.WriteHeader(http.StatusFound)
 				return
@@ -431,7 +376,7 @@ func handleAuthFunc(srv OIDCServer, idpcs []connector.Connector, tpl *template.T
 		lu, err := idpc.LoginURL(key, p)
 		if err != nil {
 			log.Errorf("Connector.LoginURL failed: %v", err)
-			redirectAuthError(w, err, state, redirectURL)
+			redirectAuthError(w, err, acr.State, redirectURL)
 			return
 		}
 
@@ -440,6 +385,68 @@ func handleAuthFunc(srv OIDCServer, idpcs []connector.Connector, tpl *template.T
 		w.WriteHeader(http.StatusFound)
 		return
 	}
+}
+
+func validateScopes(srv OIDCServer, clientID string, scopes []string) error {
+	foundOpenIDScope := false
+	for i, curScope := range scopes {
+		if i > 0 && curScope == scopes[i-1] {
+			err := oauth2.NewError(oauth2.ErrorInvalidRequest)
+			err.Description = fmt.Sprintf(
+				"Duplicate scopes are not allowed: %q",
+				curScope)
+			return err
+		}
+
+		switch {
+		case strings.HasPrefix(curScope, scope.ScopeGoogleCrossClient):
+			otherClient := curScope[len(scope.ScopeGoogleCrossClient):]
+			var allowed bool
+			var err error
+			if otherClient == clientID {
+				allowed = true
+			} else {
+				allowed, err = srv.CrossClientAuthAllowed(clientID, otherClient)
+				if err != nil {
+					return err
+				}
+			}
+
+			if !allowed {
+				err := oauth2.NewError(oauth2.ErrorInvalidRequest)
+				err.Description = fmt.Sprintf(
+					"%q is not authorized to perform cross-client requests for %q",
+					clientID, otherClient)
+				return err
+			}
+		case curScope == "openid":
+			foundOpenIDScope = true
+		case curScope == "profile":
+		case curScope == "email":
+		case curScope == scope.ScopeGroups:
+		case curScope == "offline_access":
+			// According to the spec, for offline_access scope, the client must
+			// use a response_type value that would result in an Authorization
+			// Code.  Currently oauth2.ResponseTypeCode is the only supported
+			// response type, and it's been checked above, so we don't need to
+			// check it again here.
+			//
+			// TODO(yifan): Verify that 'consent' should be in 'prompt'.
+		default:
+			// Reject all other scopes.
+			err := oauth2.NewError(oauth2.ErrorInvalidRequest)
+			err.Description = fmt.Sprintf("%q is not a recognized scope", curScope)
+			return err
+		}
+	}
+
+	if !foundOpenIDScope {
+		log.Errorf("Invalid auth request: missing 'openid' in 'scope'")
+		err := oauth2.NewError(oauth2.ErrorInvalidRequest)
+		err.Description = "Invalid auth request: missing 'openid' in 'scope'"
+		return err
+	}
+	return nil
 }
 
 func handleTokenFunc(srv OIDCServer) http.HandlerFunc {
@@ -484,6 +491,7 @@ func handleTokenFunc(srv OIDCServer) http.HandlerFunc {
 
 		var jwt *jose.JWT
 		var refreshToken string
+		var expiresAt time.Time
 		grantType := r.PostForm.Get("grant_type")
 
 		switch grantType {
@@ -494,14 +502,14 @@ func handleTokenFunc(srv OIDCServer) http.HandlerFunc {
 				writeTokenError(w, oauth2.NewError(oauth2.ErrorInvalidRequest), state)
 				return
 			}
-			jwt, refreshToken, err = srv.CodeToken(creds, code)
+			jwt, refreshToken, expiresAt, err = srv.CodeToken(creds, code)
 			if err != nil {
 				log.Errorf("couldn't exchange code for token: %v", err)
 				writeTokenError(w, err, state)
 				return
 			}
 		case oauth2.GrantTypeClientCreds:
-			jwt, err = srv.ClientCredsToken(creds)
+			jwt, expiresAt, err = srv.ClientCredsToken(creds)
 			if err != nil {
 				log.Errorf("couldn't creds for token: %v", err)
 				writeTokenError(w, err, state)
@@ -509,11 +517,12 @@ func handleTokenFunc(srv OIDCServer) http.HandlerFunc {
 			}
 		case oauth2.GrantTypeRefreshToken:
 			token := r.PostForm.Get("refresh_token")
+			scopes := r.PostForm.Get("scope")
 			if token == "" {
 				writeTokenError(w, oauth2.NewError(oauth2.ErrorInvalidRequest), state)
 				return
 			}
-			jwt, err = srv.RefreshToken(creds, token)
+			jwt, refreshToken, expiresAt, err = srv.RefreshToken(creds, strings.Split(scopes, " "), token)
 			if err != nil {
 				writeTokenError(w, err, state)
 				return
@@ -529,6 +538,7 @@ func handleTokenFunc(srv OIDCServer) http.HandlerFunc {
 			IDToken:      jwt.Encode(),
 			TokenType:    "bearer",
 			RefreshToken: refreshToken,
+			ExpiresIn:    int64(expiresAt.Sub(time.Now()).Seconds()),
 		}
 
 		b, err := json.Marshal(t)
@@ -544,6 +554,37 @@ func handleTokenFunc(srv OIDCServer) http.HandlerFunc {
 	}
 }
 
+func handleOOBFunc(s *Server, tpl *template.Template) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.Header().Set("Allow", "GET")
+			phttp.WriteError(w, http.StatusMethodNotAllowed, "GET only acceptable method")
+			return
+		}
+
+		key := r.URL.Query().Get("code")
+		if key == "" {
+			phttp.WriteError(w, http.StatusBadRequest, "Invalid Session")
+			return
+		}
+		sessionID, err := s.SessionManager.ExchangeKey(key)
+		if err != nil {
+			phttp.WriteError(w, http.StatusBadRequest, "Invalid Session")
+			return
+		}
+		code, err := s.SessionManager.NewSessionKey(sessionID)
+		if err != nil {
+			log.Errorf("problem getting NewSessionKey: %v", err)
+			phttp.WriteError(w, http.StatusInternalServerError, "Internal Server Error")
+			return
+		}
+
+		execTemplate(w, tpl, map[string]string{
+			"code": code,
+		})
+	}
+}
+
 func makeHealthHandler(checks []health.Checkable) http.Handler {
 	return health.Checker{
 		Checks: checks,
@@ -555,6 +596,7 @@ type oAuth2Token struct {
 	IDToken      string `json:"id_token"`
 	TokenType    string `json:"token_type"`
 	RefreshToken string `json:"refresh_token,omitempty"`
+	ExpiresIn    int64  `json:"expires_in"`
 }
 
 func createLastSeenCookie() *http.Cookie {

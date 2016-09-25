@@ -5,12 +5,14 @@ services:
 language: go
 
 go:
-  - 1.5.3
-  - 1.6
+  - 1.5.4
+  - 1.6.2
+  - tip
 
 env:
   - DEX_TEST_DSN="postgres://postgres@127.0.0.1:15432/postgres?sslmode=disable" ISOLATED=true
     DEX_TEST_LDAP_HOST="tlstest.local:1389"
+    DEX_TEST_LDAPS_HOST="tlstest.local:1636"
     DEX_TEST_LDAP_BINDNAME="cn=admin,dc=example,dc=org"
     DEX_TEST_LDAP_BINDPASS="admin"
 
@@ -21,7 +23,7 @@ install:
 
 script:
   - docker run -d -p 127.0.0.1:15432:5432 quay.io/coreos/postgres
-  - LDAPCONTAINER=`docker run -e LDAP_TLS_PROTOCOL_MIN=3.0 -e LDAP_TLS_CIPHER_SUITE=NORMAL -d -p 127.0.0.1:1389:389 -p 127.0.0.1:1636:636 -h tlstest.local osixia/openldap`
+  - LDAPCONTAINER=`docker run -e LDAP_TLS_PROTOCOL_MIN=3.0 -e LDAP_TLS_CIPHER_SUITE=NORMAL -d -p 127.0.0.1:1389:389 -p 127.0.0.1:1636:636 -h tlstest.local osixia/openldap:1.1.4`
   - ./build
   - ./test
   - docker cp ${LDAPCONTAINER}:container/service/:cfssl/assets/default-ca/default-ca.pem /tmp/openldap-ca.pem
@@ -31,15 +33,21 @@ script:
   - sudo sh -c 'echo "127.0.0.1 tlstest.local" >> /etc/hosts'
   - ./test-functional
   - DEX_TEST_DSN="sqlite3://:memory:" ./test-functional
+  - ./build-docker
+  - ./build-docker clean
 
 deploy:
   provider: script
-  script: "./build-docker push"
+  script: scripts/deploy
   skip_cleanup: true
   on:
     branch: master
-    go: '1.5.3'
+    go: '1.6.2'
     condition: "$TRAVIS_PULL_REQUEST = false"
 
 notifications:
   email: false
+
+matrix:
+  allow_failures:
+    - go: tip

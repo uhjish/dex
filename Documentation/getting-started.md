@@ -20,7 +20,7 @@ In addition, if you wish to try out authenticating against Google's OIDC backend
 
 * Go to https://console.developers.google.com/project and select an existing project or create a new project.
 * Click on APIs and auth > Credentials, and select an OAuth 2 client ID from the Add credentials dropdown.
-* On the "Create Client ID" screen, choose "Web Application", provide a Name and enter `http://127.0.0.1:5556/auth/google/callback` for your Authorised redirect URI.
+* On the "Create Client ID" screen, choose "Web Application", provide a Name and enter `http://127.0.0.1:5556/dex/auth/google/callback` for your Authorised redirect URI.
 * The generated client ID and client secret will be needed later.
 
 # Create Database
@@ -55,13 +55,13 @@ The dex overlord and workers allow multiple key secrets (separated by commas) to
 
 # Generate an Admin API Secret
 
-The dex overlord has a an API which is very powerful - you can create Admin users with it, so it needs to be protected somehow. This is accomplished by requiring that a secret is passed via the Authorization header of each request. This secret is 128 bytes base64 encoded, and should be sufficiently random so as to make guessing impractical:
+The dex overlord has an API which is very powerful - you can create Admin users with it, so it needs to be protected somehow. This is accomplished by requiring that a secret is passed via the Authorization header of each request. This secret is 128 bytes base64 encoded, and should be sufficiently random so as to make guessing impractical:
 
 `DEX_OVERLORD_ADMIN_API_SECRET=$(dd if=/dev/random bs=1 count=128 2>/dev/null | base64 | tr -d '\n')`
 
 # Start the overlord
 
-The overlord is responsible for creating and rotating keys and some other adminsitrative tasks. In addition, the overlord is responsible for creating the necessary database tables (and when you update, performing schema migrations), so it must be started before we do anything else. Debug logging is turned on so we can see more of what's going on. Start it up.
+The overlord is responsible for creating and rotating keys and some other administrative tasks. In addition, the overlord is responsible for creating the necessary database tables (and when you update, performing schema migrations), so it must be started before we do anything else. Debug logging is turned on so we can see more of what's going on. Start it up.
 
 `./bin/dex-overlord --admin-api-secret=$DEX_OVERLORD_ADMIN_API_SECRET --db-url=$DEX_DB_URL --key-secrets=$DEX_KEY_SECRET --log-debug=true &`
 
@@ -88,7 +88,7 @@ Once you have setup your email config run `dex-worker`:
 
 `./bin/dex-worker --db-url=$DEX_DB_URL --key-secrets=$DEX_KEY_SECRET --email-cfg=static/fixtures/emailer.json.sample --enable-registration=true --log-debug=true &`
 
-Now you have a worker which you can authenticate against, listening on `http://0.0.0.0:5556`, which is the default. Note that the default issuer URL (which can be changed on --issuerURL) is `http://127.0.0.1:5556`. The issuer URL is the base URL (i.e. no query or fragments) uniquely identifying your dex installation.
+Now you have a worker which you can authenticate against, listening on `http://0.0.0.0:5556`, which is the default. Note that the default issuer URL (which can be changed on --issuer) is `http://127.0.0.1:5556`. The issuer URL is the base URL (i.e. no query or fragments) uniquely identifying your dex installation.
 
 Note: the issuer URL MUST have an `https` scheme in production to meet spec compliance and to be considered reasonably secure.
 
@@ -142,7 +142,7 @@ DEX_APP_CLIENT_SECRET
 The included example app demonstrates registering and authenticating with dex. Start it up:
 
 ```
-./bin/example-app --client-id=$DEX_APP_CLIENT_ID --client-secret=$DEX_APP_CLIENT_SECRET --discovery=http://127.0.0.1:5556 &
+./bin/example-app --client-id=$DEX_APP_CLIENT_ID --client-secret=$DEX_APP_CLIENT_SECRET --discovery=http://127.0.0.1:5556/dex &
 ```
 
 # Authenticate with dex!
@@ -161,4 +161,4 @@ In a fully configured production environment an email provider will be set up so
 
 # Standup Dev Script
 
-A script which does almost everything in this guide exists at `contrib/standup-db.sh`. Read the comments inside before attemping to run it - it requires a little setup beforehand.
+A script which does almost everything in this guide exists at `contrib/standup-db.sh`. Read the comments inside before attempting to run it - it requires a little setup beforehand.
